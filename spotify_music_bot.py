@@ -628,9 +628,17 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
         return
 
     async with user_lock:
-        is_new = await mongodb.add_user(user.id)
-        if is_new:
-            await log_new_user(bot, user)
+        try:
+            is_new = await mongodb.add_user(
+                user_id=user.id,
+                first_name=user.first_name,
+                username=user.username,
+                dc_id=user.dc_id,
+            )
+            if is_new:
+                await log_new_user(bot, user)
+        except Exception as e:
+            print(f"[db] apple music add_user: {e}")
 
         status = await msg.reply_text(
             "<blockquote>ᯓ➤<b>Processing • • •</b></blockquote>",
