@@ -4,6 +4,7 @@ import json
 import asyncio
 import base64
 import tempfile
+import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -52,6 +53,9 @@ SPOTIFY_RE = re.compile(
 )
 APPLE_MUSIC_RE = re.compile(r"https?://music\.apple\.com/\S+")
 
+# Progress bar update interval in seconds
+PROGRESS_UPDATE_INTERVAL = 10.0
+
 # ── Concurrency (Apple Music) ─────────────────────────────────────────────────
 
 GLOBAL_AP_SEMAPHORE = asyncio.Semaphore(15)
@@ -63,6 +67,34 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
     if user_id not in _USER_LOCKS:
         _USER_LOCKS[user_id] = asyncio.Lock()
     return _USER_LOCKS[user_id]
+
+
+# ── Cancellation tokens ───────────────────────────────────────────────────────
+
+# Maps user_id → asyncio.Event  (set = cancelled)
+_CANCEL_FLAGS: dict[int, asyncio.Event] = {}
+
+
+def _get_cancel_flag(user_id: int) -> asyncio.Event:
+    if user_id not in _CANCEL_FLAGS:
+        _CANCEL_FLAGS[user_id] = asyncio.Event()
+    return _CANCEL_FLAGS[user_id]
+
+
+def _reset_cancel_flag(user_id: int):
+    """Clear the cancel flag before starting a new download."""
+    flag = _get_cancel_flag(user_id)
+    flag.clear()
+
+
+def _raise_if_cancelled(user_id: int):
+    """Raise CancelledError if the user has requested cancellation."""
+    if _get_cancel_flag(user_id).is_set():
+        raise asyncio.CancelledError("Cancelled by user")
+
+
+def _is_cancelled(user_id: int) -> bool:
+    return _get_cancel_flag(user_id).is_set()
 
 
 # ── Koyeb health-check server ─────────────────────────────────────────────────
@@ -113,6 +145,69 @@ def start_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("Dev", url=config.DEV_URL, style=ButtonStyle.PRIMARY),
         InlineKeyboardButton("Credits", callback_data="credits", style=ButtonStyle.PRIMARY),
     ]])
+
+
+# ── Progress bar builder ──────────────────────────────────────────────────────
+
+def _build_progress_bar(
+    done: int,
+    total: int,
+    current_song: str,
+    status_label: str,   # e.g. "Downloading⬇️" or "Uploading⬆️"
+    speed_mbps: float | None,
+    engine: str,         # "Spotify" or "Apple Music"
+) -> str:
+    pct = int((done / total) * 100) if total else 0
+    bar_len = 17
+    filled = int(bar_len * done / total) if total else 0
+    bar = "█" * filled + "░" * (bar_len - filled)
+    speed_str = f"{speed_mbps:.2f} MB/s" if speed_mbps is not None else "—"
+    # Truncate long song names
+    display_name = current_song if len(current_song) <= 35 else current_song[:32] + "…"
+    return (
+        f"<blockquote>"
+        f"<b>Downloaded 🎵 {done}/{total}</b>\n"
+        f"<b>Current Progress:</b> {display_name}\n"
+        f"╭────────────────────╮\n"
+        f"│ {bar} │ {pct}%\n"
+        f"╰────────────────────╯\n"
+        f"<b>Status:</b> {status_label}\n"
+        f"<b>Speed:</b> {speed_str}\n"
+        f"<b>Engine:</b> {engine}"
+        f"</blockquote>"
+    )
+
+
+# ── Throttled progress updater ────────────────────────────────────────────────
+
+class ThrottledProgress:
+    """
+    Wraps a Pyrogram message and exposes `update(...)` which only actually
+    edits the message at most once every PROGRESS_UPDATE_INTERVAL seconds.
+    """
+
+    def __init__(self, status_msg):
+        self._msg = status_msg
+        self._last_edit: float = 0.0
+
+    async def update(self, text: str, force: bool = False):
+        now = time.monotonic()
+        if not force and (now - self._last_edit) < PROGRESS_UPDATE_INTERVAL:
+            return
+        try:
+            await self._msg.edit_text(text, parse_mode=ParseMode.HTML)
+            self._last_edit = now
+        except Exception:
+            pass
+
+    async def force_update(self, text: str):
+        await self.update(text, force=True)
+
+    async def delete(self):
+        try:
+            await self._msg.delete()
+        except Exception:
+            pass
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -276,9 +371,12 @@ def _spoti_download_thumb(url: str, name: str):
         return None
 
 
-def _spoti_download_file(url: str, name: str) -> str:
+def _spoti_download_file(url: str, name: str) -> tuple[str, float]:
+    """Returns (local_path, speed_mbps)."""
     safe = re.sub(r'[\\/*?:"<>|]', "", name)[:100]
     path = os.path.join(DOWNLOAD_DIR, f"{safe}.mp3")
+    start = time.monotonic()
+    total_bytes = 0
     with requests.get(url, stream=True, timeout=120,
                       headers={"User-Agent": UA}) as r:
         r.raise_for_status()
@@ -286,9 +384,12 @@ def _spoti_download_file(url: str, name: str) -> str:
             for chunk in r.iter_content(128 * 1024):
                 if chunk:
                     f.write(chunk)
+                    total_bytes += len(chunk)
+    elapsed = time.monotonic() - start
+    speed = (total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         raise RuntimeError("downloaded file is empty")
-    return path
+    return path, speed
 
 
 def _spoti_fetch_one(s: requests.Session, form_data: dict, index: int,
@@ -305,7 +406,7 @@ def _spoti_fetch_one(s: requests.Session, form_data: dict, index: int,
     r = s.post(SPOTI_BASE + "/action/track", data=form_data, timeout=30)
     resp = r.json()
     if resp.get("error"):
-        return index, name, title, artist, None, None, resp.get("message")
+        return index, name, title, artist, None, None, resp.get("message"), 0.0
 
     soup = BeautifulSoup(resp["data"], "html.parser")
     img = soup.find("img")
@@ -324,15 +425,15 @@ def _spoti_fetch_one(s: requests.Session, form_data: dict, index: int,
             break
 
     if not href:
-        return index, name, title, artist, None, None, "no link found"
+        return index, name, title, artist, None, None, "no link found", 0.0
 
     try:
-        local_path = _spoti_download_file(href, name)
+        local_path, speed = _spoti_download_file(href, name)
     except Exception as e:
-        return index, name, title, artist, None, None, f"download failed: {e}"
+        return index, name, title, artist, None, None, f"download failed: {e}", 0.0
 
     local_thumb = _spoti_download_thumb(thumb_url, name)
-    return index, name, title, artist, local_path, local_thumb, None
+    return index, name, title, artist, local_path, local_thumb, None, speed
 
 
 def spotify_get_track(spotify_url: str):
@@ -341,7 +442,9 @@ def spotify_get_track(spotify_url: str):
     forms, fallback_thumb = _spoti_parse_forms(html)
     if not forms:
         raise Exception("no track found")
-    _, name, title, artist, local_path, thumb, err = _spoti_fetch_one(s, forms[0], 0, fallback_thumb)
+    _, name, title, artist, local_path, thumb, err, _ = _spoti_fetch_one(
+        s, forms[0], 0, fallback_thumb
+    )
     if err:
         raise Exception(err)
     return name, title, artist, local_path, thumb
@@ -358,9 +461,9 @@ def spotify_get_playlist(spotify_url: str, on_result=None):
             for i, form in enumerate(forms)
         }
         for future in as_completed(futures):
-            index, name, title, artist, local_path, thumb, err = future.result()
+            result = future.result()
             if on_result:
-                on_result(index, total, name, title, artist, local_path, thumb, err)
+                on_result(*result, total)
 
 
 def spotify_type(url: str) -> str:
@@ -390,8 +493,11 @@ def _parse_ap_filename(response: httpx.Response, fallback: str) -> str:
 
 async def _ap_download_file(
     client: httpx.AsyncClient, url: str, dest_dir: str, fallback_name: str
-) -> tuple[bool, str]:
+) -> tuple[bool, str, float]:
+    """Returns (success, dest_path, speed_mbps)."""
     try:
+        start = time.monotonic()
+        total_bytes = 0
         async with client.stream("GET", url, headers=AP_HEADERS, follow_redirects=True) as r:
             r.raise_for_status()
             fname = _parse_ap_filename(r, fallback_name)
@@ -400,10 +506,13 @@ async def _ap_download_file(
             with open(dest, "wb") as f:
                 async for chunk in r.aiter_bytes(CHUNK_SIZE):
                     f.write(chunk)
-        return True, dest
+                    total_bytes += len(chunk)
+        elapsed = time.monotonic() - start
+        speed = (total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0.0
+        return True, dest, speed
     except Exception as e:
         print(f"[AP Download] {url} failed: {e}")
-        return False, ""
+        return False, "", 0.0
 
 
 _EMOJI_RE = re.compile(
@@ -467,7 +576,14 @@ async def _ap_handle_track(
     album_thumb_path: str | None,
     first_track_ref: list,
     user,
+    progress: ThrottledProgress | None = None,
+    done_ref: list | None = None,        # [int] mutable counter
+    speed_ref: list | None = None,       # [float] last known speed
 ):
+    # ── Cancellation check ────────────────────────────────────────────────────
+    if _is_cancelled(user.id):
+        return
+
     audio_entry, cover_entry = _split_ap_links(links)
 
     if not audio_entry:
@@ -481,7 +597,22 @@ async def _ap_handle_track(
 
     with tempfile.TemporaryDirectory() as tmp:
         print(f"\n[AP Upload] Track {idx}/{total} → downloading audio…")
-        ok, raw_audio_path = await _ap_download_file(dl, audio_entry["link"], tmp, f"track_{idx}.mp3")
+
+        # ── Update progress: Downloading ──────────────────────────────────────
+        if progress and done_ref is not None:
+            song_hint = f"Track {idx}"
+            bar_text = _build_progress_bar(
+                done_ref[0], total, song_hint, "Downloading⬇️",
+                speed_ref[0] if speed_ref else None, "Apple Music",
+            )
+            await progress.update(bar_text)
+
+        ok, raw_audio_path, dl_speed = await _ap_download_file(
+            dl, audio_entry["link"], tmp, f"track_{idx}.mp3"
+        )
+        if speed_ref is not None:
+            speed_ref[0] = dl_speed
+
         if not ok:
             await flood_safe(
                 message.reply_text,
@@ -489,6 +620,9 @@ async def _ap_handle_track(
                 parse_mode=ParseMode.HTML,
                 reply_parameters=ReplyParameters(message_id=message.id),
             )
+            return
+
+        if _is_cancelled(user.id):
             return
 
         raw_name = os.path.splitext(os.path.basename(raw_audio_path))[0]
@@ -505,13 +639,23 @@ async def _ap_handle_track(
 
         thumb_path = album_thumb_path
         if cover_entry:
-            c_ok, cover_path = await _ap_download_file(dl, cover_entry["link"], tmp, f"cover_{idx}.jpg")
+            c_ok, cover_path, _ = await _ap_download_file(
+                dl, cover_entry["link"], tmp, f"cover_{idx}.jpg"
+            )
             if c_ok:
                 if not cover_path.lower().endswith((".jpg", ".jpeg")):
                     jpg_path = cover_path + ".jpg"
                     os.rename(cover_path, jpg_path)
                     cover_path = jpg_path
                 thumb_path = cover_path
+
+        # ── Update progress: Uploading ────────────────────────────────────────
+        if progress and done_ref is not None:
+            bar_text = _build_progress_bar(
+                done_ref[0], total, song_name, "Uploading⬆️",
+                speed_ref[0] if speed_ref else None, "Apple Music",
+            )
+            await progress.update(bar_text)
 
         caption = (
             f"<blockquote>"
@@ -539,6 +683,16 @@ async def _ap_handle_track(
                 reply_parameters=ReplyParameters(message_id=message.id),
             )
             print(f"[AP Upload] ✓ Track {idx}/{total} sent.")
+
+            # ── Increment done counter and refresh bar ─────────────────────────
+            if done_ref is not None:
+                done_ref[0] += 1
+            if progress and done_ref is not None:
+                bar_text = _build_progress_bar(
+                    done_ref[0], total, song_name, "Uploading⬆️",
+                    speed_ref[0] if speed_ref else None, "Apple Music",
+                )
+                await progress.update(bar_text)
 
             await log_track_to_channel(client, user, song_name, idx, total, audio_path, thumb_path)
 
@@ -578,6 +732,28 @@ async def cmd_start(bot: Client, msg: Message):
         "</blockquote>",
         parse_mode=ParseMode.HTML,
         reply_markup=start_keyboard(),
+    )
+
+
+async def cmd_cancel(bot: Client, msg: Message):
+    """Cancel any ongoing download for this user."""
+    user = msg.from_user
+    lock = _get_user_lock(user.id)
+
+    if not lock.locked():
+        await msg.reply_text(
+            "<blockquote>ℹ️ <b>No active download to cancel.</b></blockquote>",
+            parse_mode=ParseMode.HTML,
+            reply_parameters=ReplyParameters(message_id=msg.id),
+        )
+        return
+
+    _get_cancel_flag(user.id).set()
+    await msg.reply_text(
+        "<blockquote>🛑 <b>Cancellation requested.</b>\n"
+        "<i>The current download will stop after the track in progress finishes.</i></blockquote>",
+        parse_mode=ParseMode.HTML,
+        reply_parameters=ReplyParameters(message_id=msg.id),
     )
 
 
@@ -621,11 +797,14 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
     if user_lock.locked():
         await msg.reply_text(
             "<blockquote>ᯓ➤<b>You already have a download in progress • • •</b>\n"
-            "<i>Please wait for it to finish.</i></blockquote>",
+            "<i>Please wait for it to finish or use /cancel to stop it.</i></blockquote>",
             parse_mode=ParseMode.HTML,
             reply_parameters=ReplyParameters(message_id=msg.id),
         )
         return
+
+    # Reset any previous cancel signal before starting
+    _reset_cancel_flag(user.id)
 
     async with user_lock:
         try:
@@ -640,11 +819,12 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
         except Exception as e:
             print(f"[db] apple music add_user: {e}")
 
-        status = await msg.reply_text(
+        status_msg = await msg.reply_text(
             "<blockquote>ᯓ➤<b>Processing • • •</b></blockquote>",
             parse_mode=ParseMode.HTML,
             reply_parameters=ReplyParameters(message_id=msg.id),
         )
+        progress = ThrottledProgress(status_msg)
 
         is_playlist = False
 
@@ -658,19 +838,17 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                 print(f"\n[AP Flow] URL: {url} | Tracks: {total} | Thumb: {album_thumb}")
 
                 if total == 0:
-                    await status.edit_text(
+                    await progress.force_update(
                         "<blockquote>❌ <b>No tracks found for that link.</b></blockquote>",
-                        parse_mode=ParseMode.HTML,
                     )
                     return
 
                 is_playlist = total > 1
                 label = "playlist" if is_playlist else "track"
-                await status.edit_text(
+                await progress.force_update(
                     f"<blockquote>•ᴗ•<b> Processing {label}</b> ◌ {total} track{'s' if total > 1 else ''}…"
                     + ("\n<i>Playlist detected - please wait…</i>" if is_playlist else "")
                     + "</blockquote>",
-                    parse_mode=ParseMode.HTML,
                 )
 
                 _thumb_tmp = tempfile.mkdtemp()
@@ -699,6 +877,9 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                 ]
 
                 first_track_ref = [None]
+                # Shared mutable state for progress tracking
+                done_ref  = [0]
+                speed_ref = [None]
 
                 async with httpx.AsyncClient(
                     follow_redirects=True,
@@ -706,36 +887,56 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                     limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
                 ) as dl:
                     for coro in asyncio.as_completed(link_tasks):
+                        # Check cancellation before processing each track
+                        if _is_cancelled(user.id):
+                            break
+
                         idx, links = await coro
                         await _ap_handle_track(
                             bot, msg, dl,
                             idx, total, links,
                             album_thumb_path, first_track_ref,
                             user,
+                            progress=progress if is_playlist else None,
+                            done_ref=done_ref if is_playlist else None,
+                            speed_ref=speed_ref if is_playlist else None,
                         )
                         if is_playlist and idx < total:
                             await asyncio.sleep(PLAYLIST_UPLOAD_DELAY)
 
+        except asyncio.CancelledError:
+            pass  # handled below
         except Exception as e:
-            await status.edit_text(
+            await progress.force_update(
                 f"<blockquote>❌ <b>Failed.</b>\n<i>{e}</i></blockquote>",
-                parse_mode=ParseMode.HTML,
             )
             return
 
+        # ── Post-download messages ────────────────────────────────────────────
+        if _is_cancelled(user.id):
+            await flood_safe(
+                msg.reply_text,
+                "<blockquote>🛑 <b>Download cancelled.</b></blockquote>",
+                parse_mode=ParseMode.HTML,
+                reply_parameters=ReplyParameters(message_id=msg.id),
+            )
+            await progress.delete()
+            return
+
         if is_playlist:
+            done_count = done_ref[0] if 'done_ref' in dir() else 0
             await flood_safe(
                 msg.reply_text,
                 f"<blockquote>"
                 f"✅ <b>Playlist done!</b>\n\n"
-                f"<b>Total :</b>  {total} track{'s' if total > 1 else ''} sent 🎶"
+                f"<b>Total :</b>  {done_count} track{'s' if done_count != 1 else ''} sent 🎶"
                 f"</blockquote>",
                 parse_mode=ParseMode.HTML,
                 reply_parameters=ReplyParameters(message_id=msg.id),
             )
 
         await log_download_summary(bot, user, first_track_ref[0] or "Unknown", total)
-        await status.delete()
+        await progress.delete()
 
 
 # ── Spotify handler ───────────────────────────────────────────────────────────
@@ -774,56 +975,114 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
             cleanup(thumb)
 
     elif stype in ("playlist", "album"):
-        status = await msg.reply_text("fetching playlist...")
-        completed = 0
-        failed    = 0
-        main_loop = asyncio.get_event_loop()
-
-        def on_result(_, total, name, title, artist, local_path, thumb, err):
-            nonlocal completed, failed
-            if err:
-                failed += 1
-            else:
-                completed += 1
-            asyncio.run_coroutine_threadsafe(
-                _spoti_send_track(
-                    bot, msg, status,
-                    name, title, artist, local_path, thumb, err,
-                    completed, failed, total, user,
-                ),
-                loop=main_loop,
-            )
-
-        try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: spotify_get_playlist(url, on_result=on_result),
-            )
-            try:
-                await status.delete()
-            except Exception:
-                pass
-
-        except Exception as e:
-            await status.edit_text(
-                f"something went wrong\n\n<code>{e}</code>",
+        user_lock = _get_user_lock(user.id)
+        if user_lock.locked():
+            await msg.reply_text(
+                "<blockquote>ᯓ➤<b>You already have a download in progress • • •</b>\n"
+                "<i>Please wait for it to finish or use /cancel to stop it.</i></blockquote>",
                 parse_mode=ParseMode.HTML,
+                reply_parameters=ReplyParameters(message_id=msg.id),
             )
+            return
+
+        _reset_cancel_flag(user.id)
+
+        async with user_lock:
+            status_msg = await msg.reply_text("fetching playlist...")
+            progress = ThrottledProgress(status_msg)
+
+            completed  = 0
+            failed     = 0
+            total_ref  = [0]        # set once we know total
+            speed_ref  = [None]     # last seen speed
+            main_loop  = asyncio.get_event_loop()
+
+            def on_result(index, name, title, artist, local_path, thumb, err, speed, total):
+                nonlocal completed, failed
+                total_ref[0] = total
+                if speed:
+                    speed_ref[0] = speed
+                if err:
+                    failed += 1
+                else:
+                    completed += 1
+                asyncio.run_coroutine_threadsafe(
+                    _spoti_send_track(
+                        bot, msg, progress,
+                        name, title, artist, local_path, thumb, err,
+                        completed, failed, total, user, speed_ref,
+                    ),
+                    loop=main_loop,
+                )
+
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: spotify_get_playlist(url, on_result=on_result),
+                )
+            except Exception as e:
+                await progress.force_update(
+                    f"<blockquote>❌ something went wrong\n\n<code>{e}</code></blockquote>",
+                )
+                return
+
+            # ── Final summary ─────────────────────────────────────────────────
+            if _is_cancelled(user.id):
+                await flood_safe(
+                    msg.reply_text,
+                    "<blockquote>🛑 <b>Download cancelled.</b></blockquote>",
+                    parse_mode=ParseMode.HTML,
+                    reply_parameters=ReplyParameters(message_id=msg.id),
+                )
+            else:
+                total_done = total_ref[0]
+                await flood_safe(
+                    msg.reply_text,
+                    f"<blockquote>"
+                    f"✅ <b>Playlist done!</b>\n\n"
+                    f"<b>Total :</b>  {completed} track{'s' if completed != 1 else ''} sent 🎶"
+                    f"</blockquote>",
+                    parse_mode=ParseMode.HTML,
+                    reply_parameters=ReplyParameters(message_id=msg.id),
+                )
+
+            await progress.delete()
 
     else:
         await msg.reply_text("unsupported spotify link type.")
 
 
 async def _spoti_send_track(
-    bot, msg, status,
+    bot, msg, progress: ThrottledProgress,
     name, title, artist, local_path, thumb, err,
     completed, failed, total, user,
+    speed_ref: list,
 ):
+    # Check cancellation
+    if _is_cancelled(user.id):
+        cleanup(local_path)
+        cleanup(thumb)
+        return
+
     if err:
         print(f"[Spotify skip] {name}: {err}")
+        # Still update the bar so the count advances
+        bar_text = _build_progress_bar(
+            completed + failed, total, name, "Skipped⚠️",
+            speed_ref[0], "Spotify",
+        )
+        await progress.update(bar_text)
         return
+
     try:
+        # Show "Uploading" state in bar before sending
+        bar_text = _build_progress_bar(
+            completed + failed - 1, total, name, "Uploading⬆️",
+            speed_ref[0], "Spotify",
+        )
+        await progress.update(bar_text)
+
         await msg.reply_audio(
             audio=local_path,
             caption=f"<b>{name}</b>",
@@ -833,14 +1092,14 @@ async def _spoti_send_track(
             parse_mode=ParseMode.HTML,
         )
         await log_download(bot, user, name)
-        try:
-            await status.edit_text(
-                f"<blockquote>📥 <b>{completed + failed}/{total}</b> done\n"
-                f"✅ <b>{completed}</b> succeeded   ❌ <b>{failed}</b> failed</blockquote>",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+
+        # Refresh bar after successful upload
+        bar_text = _build_progress_bar(
+            completed + failed, total, name, "Uploading⬆️",
+            speed_ref[0], "Spotify",
+        )
+        await progress.update(bar_text)
+
     except Exception as e:
         print(f"[Spotify send] {name}: {e}")
     finally:
@@ -862,11 +1121,12 @@ async def main():
         bot_token=config.BOT_TOKEN,
     )
 
-    bot.add_handler(MessageHandler(cmd_start,       filters.command("start") & filters.private))
+    bot.add_handler(MessageHandler(cmd_start,  filters.command("start")  & filters.private))
+    bot.add_handler(MessageHandler(cmd_cancel, filters.command("cancel") & filters.private))
     bot.add_handler(CallbackQueryHandler(cb_credits, filters.regex("^credits$")))
     bot.add_handler(MessageHandler(
         handle_message,
-        filters.text & filters.private & ~filters.command(["start"]),
+        filters.text & filters.private & ~filters.command(["start", "cancel"]),
     ))
 
     await mongodb.connect()
