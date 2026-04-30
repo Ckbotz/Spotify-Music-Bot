@@ -3,3 +3,7 @@ TgCrypto
 requests
 bs4
 motor
+pillow
+httpx
+beautifulsoup4
+lxml
