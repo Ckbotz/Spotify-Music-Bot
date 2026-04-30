@@ -1,0 +1,6 @@
+build:
+  docker:
+    worker: Dockerfile
+
+run:
+  worker: python spotify_music_bot.py
