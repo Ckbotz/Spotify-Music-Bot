@@ -450,20 +450,22 @@ def spotify_get_track(spotify_url: str):
     return name, title, artist, local_path, thumb
 
 
+# ── CHANGED: Sequential playlist — yields one result at a time ────────────────
 def spotify_get_playlist(spotify_url: str, on_result=None):
+    """
+    Processes tracks one-by-one: fetch → download → call on_result.
+    This ensures upload of track N completes before track N+1 starts downloading.
+    """
     s = _make_spoti_session()
     html = _spoti_fetch_action(s, spotify_url)
     forms, fallback_thumb = _spoti_parse_forms(html)
     total = len(forms)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(_spoti_fetch_one, s, form, i, fallback_thumb): i
-            for i, form in enumerate(forms)
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            if on_result:
-                on_result(*result, total)
+
+    for i, form in enumerate(forms):
+        result = _spoti_fetch_one(s, form, i, fallback_thumb)
+        if on_result:
+            on_result(*result, total)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def spotify_type(url: str) -> str:
@@ -865,33 +867,27 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                     except Exception as e:
                         print(f"[AP Thumb] Album art failed: {e}")
 
-                per_request_sem = asyncio.Semaphore(3)
-
-                async def _get_links_guarded(f, i):
-                    async with GLOBAL_AP_SEMAPHORE:
-                        return await get_links_for_track(fetch_cl, f, per_request_sem, i)
-
-                link_tasks = [
-                    asyncio.ensure_future(_get_links_guarded(f, i + 1))
-                    for i, f in enumerate(track_forms)
-                ]
-
-                first_track_ref = [None]
-                # Shared mutable state for progress tracking
-                done_ref  = [0]
-                speed_ref = [None]
-
+                # ── CHANGED: one shared download client for all tracks ─────────
                 async with httpx.AsyncClient(
                     follow_redirects=True,
                     timeout=AP_TIMEOUT,
                     limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
                 ) as dl:
-                    for coro in asyncio.as_completed(link_tasks):
-                        # Check cancellation before processing each track
+                    first_track_ref = [None]
+                    done_ref  = [0]
+                    speed_ref = [None]
+
+                    per_request_sem = asyncio.Semaphore(3)
+
+                    # ── CHANGED: sequential loop — one track fully processed before next ──
+                    for i, form in enumerate(track_forms):
                         if _is_cancelled(user.id):
                             break
 
-                        idx, links = await coro
+                        idx, links = await get_links_for_track(
+                            fetch_cl, form, per_request_sem, i + 1
+                        )
+
                         await _ap_handle_track(
                             bot, msg, dl,
                             idx, total, links,
@@ -901,8 +897,10 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                             done_ref=done_ref if is_playlist else None,
                             speed_ref=speed_ref if is_playlist else None,
                         )
-                        if is_playlist and idx < total:
+
+                        if is_playlist and (i + 1) < total:
                             await asyncio.sleep(PLAYLIST_UPLOAD_DELAY)
+                    # ─────────────────────────────────────────────────────────
 
         except asyncio.CancelledError:
             pass  # handled below
@@ -924,7 +922,7 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
             return
 
         if is_playlist:
-            done_count = done_ref[0] if 'done_ref' in dir() else 0
+            done_count = done_ref[0]
             await flood_safe(
                 msg.reply_text,
                 f"<blockquote>"
@@ -993,10 +991,13 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
 
             completed  = 0
             failed     = 0
-            total_ref  = [0]        # set once we know total
-            speed_ref  = [None]     # last seen speed
+            total_ref  = [0]
+            speed_ref  = [None]
             main_loop  = asyncio.get_event_loop()
 
+            # ── CHANGED: on_result now awaits upload before returning ─────────
+            # We use a threading Event so the executor thread blocks until the
+            # coroutine dispatched into the event loop has fully completed.
             def on_result(index, name, title, artist, local_path, thumb, err, speed, total):
                 nonlocal completed, failed
                 total_ref[0] = total
@@ -1006,14 +1007,24 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
                     failed += 1
                 else:
                     completed += 1
-                asyncio.run_coroutine_threadsafe(
-                    _spoti_send_track(
-                        bot, msg, progress,
-                        name, title, artist, local_path, thumb, err,
-                        completed, failed, total, user, speed_ref,
-                    ),
-                    loop=main_loop,
-                )
+
+                # Submit coroutine and WAIT for it to finish before continuing
+                # so the next _spoti_fetch_one only starts after upload is done.
+                done_event = threading.Event()
+
+                async def _run_and_signal():
+                    try:
+                        await _spoti_send_track(
+                            bot, msg, progress,
+                            name, title, artist, local_path, thumb, err,
+                            completed, failed, total, user, speed_ref,
+                        )
+                    finally:
+                        done_event.set()
+
+                asyncio.run_coroutine_threadsafe(_run_and_signal(), loop=main_loop)
+                done_event.wait()   # block the thread until upload finishes
+            # ─────────────────────────────────────────────────────────────────
 
             try:
                 loop = asyncio.get_running_loop()
@@ -1036,7 +1047,6 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
                     reply_parameters=ReplyParameters(message_id=msg.id),
                 )
             else:
-                total_done = total_ref[0]
                 await flood_safe(
                     msg.reply_text,
                     f"<blockquote>"
@@ -1067,7 +1077,6 @@ async def _spoti_send_track(
 
     if err:
         print(f"[Spotify skip] {name}: {err}")
-        # Still update the bar so the count advances
         bar_text = _build_progress_bar(
             completed + failed, total, name, "Skipped⚠️",
             speed_ref[0], "Spotify",
@@ -1076,7 +1085,6 @@ async def _spoti_send_track(
         return
 
     try:
-        # Show "Uploading" state in bar before sending
         bar_text = _build_progress_bar(
             completed + failed - 1, total, name, "Uploading⬆️",
             speed_ref[0], "Spotify",
@@ -1093,7 +1101,6 @@ async def _spoti_send_track(
         )
         await log_download(bot, user, name)
 
-        # Refresh bar after successful upload
         bar_text = _build_progress_bar(
             completed + failed, total, name, "Uploading⬆️",
             speed_ref[0], "Spotify",
