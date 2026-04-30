@@ -4,6 +4,8 @@ import json
 import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 import requests
 from bs4 import BeautifulSoup
@@ -35,6 +37,25 @@ MAX_WORKERS = 5
 SPOTIFY_RE = re.compile(
     r"https?://open\.spotify\.com/(track|playlist|album)/[A-Za-z0-9]+"
 )
+
+
+# ── Koyeb health-check server ─────────────────────────────────────────────────
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass  # silence access logs
+
+
+def _start_health_server(port: int = 8080):
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[health] listening on port {port}")
 
 
 # ── Spotify scraper ───────────────────────────────────────────────────────────
@@ -420,6 +441,8 @@ async def _send_track(
 # ── entry point ───────────────────────────────────────────────────────────────
 
 async def main():
+    _start_health_server(port=8080)
+
     bot = Client(
         "spoti_bot",
         api_id=config.API_ID,
