@@ -65,3 +65,10 @@ async def add_user(
         upsert=True,
     )
     return result.upserted_id is not None
+
+
+async def total_users() -> int:
+    """Return total number of registered users."""
+    if _users is None:
+        return 0
+    return await _users.count_documents({})
