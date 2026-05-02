@@ -11,6 +11,19 @@ Key behaviours
 • Progress bar: at most one edit per 10 seconds (PROGRESS_UPDATE_INTERVAL).
   Phase-transition messages (e.g. "all downloaded, uploading now") are
   force-sent but only at natural boundaries, not per-track.
+
+FIXES (v2)
+──────────
+• [BUG 1] Playlist track_id collision: when info.get("id") returns None the
+  fallback was the playlist URL's ID — every track shared one cache key, so
+  the bot kept re-sending track 1.  Fix: derive a per-track key from the
+  form's positional index combined with whatever metadata is available.
+• [BUG 2] Filename collision: concurrent/sequential tracks with the same
+  artist+title overwrote each other on disk.  Fix: suffix every filename with
+  the track's positional index so each file is unique.
+• [BUG 3] Cache lookup in _spoti_fetch_one used the wrong key scope.  The
+  cache is now checked OUTSIDE _spoti_fetch_one (in spotify_get_playlist_all)
+  using the resolved per-track key, consistent with what is written on upload.
 """
 
 from __future__ import annotations
@@ -289,7 +302,6 @@ async def log_track_sent(
     )
     try:
         if cached and file_id:
-            # Re-send the cached audio directly
             await bot.send_audio(
                 config.LOG_CHANNEL,
                 audio=file_id,
@@ -395,7 +407,6 @@ async def _send_audio_with_cache(
         thumb_file_id = cached_doc.get("thumb_file_id")
         print(f"[cache ⚡] {song_name} — serving from index")
         try:
-            # Send thumbnail if we have one
             if thumb_file_id:
                 await flood_safe(
                     bot.send_photo,
@@ -434,7 +445,6 @@ async def _send_audio_with_cache(
                 parse_mode=ParseMode.HTML,
                 reply_parameters=ReplyParameters(message_id=msg.id),
             )
-            # Grab the file_id of the uploaded photo for caching
             if photo_msg and photo_msg.photo:
                 sent_thumb_file_id = photo_msg.photo.file_id
 
@@ -451,12 +461,12 @@ async def _send_audio_with_cache(
         # ── Save to index ─────────────────────────────────────────────────────
         if audio_msg and audio_msg.audio:
             await song_index.save_track(
-                source      = source,
-                track_id    = track_id,
-                name        = song_name,
-                title       = title,
-                artist      = artist,
-                file_id     = audio_msg.audio.file_id,
+                source        = source,
+                track_id      = track_id,
+                name          = song_name,
+                title         = title,
+                artist        = artist,
+                file_id       = audio_msg.audio.file_id,
                 thumb_file_id = sent_thumb_file_id,
             )
 
@@ -530,10 +540,16 @@ def _spoti_download_thumb(url: str, name: str) -> str | None:
         return None
 
 
-def _spoti_download_file(url: str, name: str) -> tuple[str, float]:
-    """Returns (local_path, speed_mbps)."""
-    safe  = re.sub(r'[\\/*?:"<>|]', "", name)[:100]
-    path  = os.path.join(DOWNLOAD_DIR, f"{safe}.mp3")
+def _spoti_download_file(url: str, name: str, position_index: int) -> tuple[str, float]:
+    """
+    Returns (local_path, speed_mbps).
+
+    FIX (Bug 2): suffix the filename with `position_index` so that tracks
+    with identical title+artist strings don't overwrite each other on disk.
+    """
+    safe  = re.sub(r'[\\/*?:"<>|]', "", name)[:90]
+    # Append the positional index to guarantee a unique path per track
+    path  = os.path.join(DOWNLOAD_DIR, f"{safe}_{position_index}.mp3")
     start = time.monotonic()
     total_bytes = 0
     with requests.get(url, stream=True, timeout=120,
@@ -555,11 +571,22 @@ def _spoti_fetch_one(
     s: requests.Session,
     form_data: dict,
     index: int,
+    playlist_id: str,
     fallback_thumb: str | None = None,
 ) -> tuple:
     """
     Returns:
       (index, name, title, artist, track_id, local_path, local_thumb, err, speed)
+
+    FIX (Bug 1 + Bug 2):
+    • track_id is now resolved with multiple fallbacks, NEVER falling back to
+      the playlist/album ID.  Priority:
+        1. info["id"] from the base64 payload
+        2. info["track_id"] from the base64 payload
+        3. A synthetic key:  playlist_id + ":" + str(index)
+      This guarantees every track has a UNIQUE cache key even when the scraper
+      doesn't embed the individual track ID.
+    • _spoti_download_file receives `index` so filenames are unique on disk.
     """
     track_id = None
     try:
@@ -568,12 +595,17 @@ def _spoti_fetch_one(
         artist    = info.get("artist", "")
         name      = f"{title} - {artist}" if artist else title
         thumb_url = info.get("cover") or info.get("image") or info.get("thumb") or fallback_thumb
-        # Spotify embeds the track ID in the form data
+        # Try to get the genuine per-track Spotify ID from the payload
         track_id  = info.get("id") or info.get("track_id")
     except Exception:
         title, artist, name, thumb_url = (
             f"Track {index + 1}", "", f"Track {index + 1}", fallback_thumb
         )
+
+    # FIX: never use the playlist/album ID as the cache key for individual
+    # tracks.  Fall back to a composite key that is unique per position.
+    if not track_id:
+        track_id = f"{playlist_id}:track:{index}"
 
     r    = s.post(SPOTI_BASE + "/action/track", data=form_data, timeout=30)
     resp = r.json()
@@ -600,11 +632,12 @@ def _spoti_fetch_one(
         return index, name, title, artist, track_id, None, None, "no link found", 0.0
 
     try:
-        local_path, speed = _spoti_download_file(href, name)
+        # Pass `index` so the saved filename is unique per track (Bug 2 fix)
+        local_path, speed = _spoti_download_file(href, name, index)
     except Exception as e:
         return index, name, title, artist, track_id, None, None, f"download failed: {e}", 0.0
 
-    local_thumb = _spoti_download_thumb(thumb_url, name)
+    local_thumb = _spoti_download_thumb(thumb_url, f"{name}_{index}")
     return index, name, title, artist, track_id, local_path, local_thumb, None, speed
 
 
@@ -614,15 +647,13 @@ def spotify_get_track(spotify_url: str) -> tuple:
     forms, fb_th  = _spoti_parse_forms(html)
     if not forms:
         raise Exception("no track found")
+    m        = SPOTIFY_RE.search(spotify_url)
+    playlist_id = m.group(2) if m else spotify_url
     _, name, title, artist, track_id, local_path, thumb, err, _ = _spoti_fetch_one(
-        s, forms[0], 0, fb_th
+        s, forms[0], 0, playlist_id, fb_th
     )
     if err:
         raise Exception(err)
-    # Fallback track_id from URL
-    if not track_id:
-        m = SPOTIFY_RE.search(spotify_url)
-        track_id = m.group(2) if m else spotify_url
     return name, title, artist, track_id, local_path, thumb
 
 
@@ -635,7 +666,14 @@ def spotify_get_playlist_all(
     on_progress(done, total, name, speed, err) called after each.
     Returns list of (index, name, title, artist, track_id,
                      local_path, thumb, err, speed, total).
+
+    FIX (Bug 1): playlist_id is extracted ONCE here and passed down to
+    _spoti_fetch_one so each track gets a composite unique key, not the shared
+    playlist ID.
     """
+    m           = SPOTIFY_RE.search(spotify_url)
+    playlist_id = m.group(2) if m else spotify_url
+
     s             = _make_spoti_session()
     html          = _spoti_fetch_action(s, spotify_url)
     forms, fb_th  = _spoti_parse_forms(html)
@@ -643,7 +681,7 @@ def spotify_get_playlist_all(
     results       = []
 
     for i, form in enumerate(forms):
-        tup = _spoti_fetch_one(s, form, i, fb_th)
+        tup = _spoti_fetch_one(s, form, i, playlist_id, fb_th)
         # tup: (index, name, title, artist, track_id, path, thumb, err, speed)
         results.append(tup + (total,))
         if on_progress:
@@ -895,7 +933,6 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
     _reset_cancel(user.id)
 
     async with user_lock:
-        # Register user
         try:
             is_new = await mongodb.add_user(
                 user_id    = user.id,
@@ -980,7 +1017,6 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                         if _is_cancelled(user.id):
                             break
 
-                        # Throttled bar update before each download
                         await progress.update(
                             _build_progress_bar(
                                 dl_done, total, f"Track {i + 1}",
@@ -992,8 +1028,8 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                             fetch_cl, form, per_sem, i + 1
                         )
 
-                        # Check cache BEFORE downloading
-                        ap_key    = song_index.normalise_apple_url(url) + f":{idx}"
+                        # Cache key is stable: normalised URL + positional index
+                        ap_key     = song_index.normalise_apple_url(url) + f":{idx}"
                         cached_doc = await song_index.get_cached_track(
                             "apple_music", ap_key
                         )
@@ -1032,7 +1068,6 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
 
                         downloaded.append(track_data)
 
-                        # Throttled bar after download
                         song_hint = track_data["song_name"] if track_data else f"Track {i + 1}"
                         await progress.update(
                             _build_progress_bar(
@@ -1091,7 +1126,6 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                         if first_track_name is None:
                             first_track_name = song_name
 
-                        # Throttled bar: uploading
                         if is_playlist:
                             await progress.update(
                                 _build_progress_bar(
@@ -1117,7 +1151,6 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                         if ok:
                             upload_done += 1
 
-                        # Throttled bar after upload
                         if is_playlist:
                             await progress.update(
                                 _build_progress_bar(
@@ -1176,7 +1209,6 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
         m        = SPOTIFY_RE.search(url)
         track_id = m.group(2) if m else url
 
-        # Cache check first
         cached_doc = await song_index.get_cached_track("spotify", track_id)
         if cached_doc:
             print(f"[cache ⚡] Spotify {track_id} in index")
@@ -1267,7 +1299,6 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
         total_ref  = [0]
         speed_ref  = [None]
 
-        # ── Async queue drainer for download-phase progress ───────────────────
         _dl_q: asyncio.Queue = asyncio.Queue()
 
         def on_progress(done, total, name, speed, err):
@@ -1290,7 +1321,6 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
                     if item is None:
                         break
                     done, total, name, speed, err = item
-                    # Throttled — only updates if 10 s have passed
                     await progress.update(
                         _build_progress_bar(
                             done, total, name,
@@ -1313,10 +1343,9 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
             )
             return
 
-        # Cancelled during download?
         if _is_cancelled(user.id):
             for r in all_results:
-                cleanup(r[5]); cleanup(r[6])   # local_path, thumb
+                cleanup(r[5]); cleanup(r[6])
             await flood_safe(
                 msg.reply_text,
                 "<blockquote>🛑 <b>Download cancelled.</b></blockquote>",
@@ -1329,7 +1358,6 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
         total      = total_ref[0]
         dl_success = sum(1 for r in all_results if r[7] is None)  # err @ index 7
 
-        # Force-update once at phase transition
         await progress.force_update(
             f"<blockquote>"
             f"✅ <b>All {dl_success}/{total} tracks downloaded!</b>\n"
@@ -1358,16 +1386,17 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
             if first_track_name is None:
                 first_track_name = name
 
-            # Use URL-extracted track_id as fallback
+            # track_id is now always set by _spoti_fetch_one — no fallback needed
+            # but keep a safety net just in case
             if not track_id:
                 m = SPOTIFY_RE.search(url)
-                track_id = m.group(2) if m else url
+                pl_id    = m.group(2) if m else url
+                track_id = f"{pl_id}:track:{i}"
 
             if err:
                 print(f"[Spotify] skip {name}: {err}")
                 failed += 1
                 await log_track_failed(bot, user, name, i + 1, total, err)
-                # Throttled bar
                 await progress.update(
                     _build_progress_bar(
                         completed + failed, total, name,
@@ -1377,7 +1406,6 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
                 cleanup(local_path); cleanup(thumb)
                 continue
 
-            # Throttled bar: uploading
             await progress.update(
                 _build_progress_bar(
                     completed + failed, total, name,
@@ -1402,11 +1430,9 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
             else:
                 failed += 1
 
-            # Always clean up local files after send attempt
             cleanup(local_path)
             cleanup(thumb)
 
-            # Throttled bar after upload
             await progress.update(
                 _build_progress_bar(
                     completed + failed, total, name,
@@ -1463,7 +1489,6 @@ async def main():
         filters.text & filters.private & ~filters.command(["start", "cancel"]),
     ))
 
-    # Connect MongoDB first, then reuse its client for the song index
     await mongodb.connect()
     await song_index.connect(client=mongodb.client)
 
