@@ -450,22 +450,26 @@ def spotify_get_track(spotify_url: str):
     return name, title, artist, local_path, thumb
 
 
-# ── CHANGED: Sequential playlist — yields one result at a time ────────────────
-def spotify_get_playlist(spotify_url: str, on_result=None):
+def spotify_get_playlist_all(spotify_url: str, on_download_progress=None):
     """
-    Processes tracks one-by-one: fetch → download → call on_result.
-    This ensures upload of track N completes before track N+1 starts downloading.
+    Downloads ALL tracks first one-by-one, collecting results.
+    Calls on_download_progress(done, total, name, speed) after each download.
+    Returns list of result tuples: (index, name, title, artist, local_path, thumb, err, speed)
     """
     s = _make_spoti_session()
     html = _spoti_fetch_action(s, spotify_url)
     forms, fallback_thumb = _spoti_parse_forms(html)
     total = len(forms)
+    results = []
 
     for i, form in enumerate(forms):
         result = _spoti_fetch_one(s, form, i, fallback_thumb)
-        if on_result:
-            on_result(*result, total)
-# ─────────────────────────────────────────────────────────────────────────────
+        results.append(result + (total,))  # append total as last element
+        if on_download_progress:
+            _, name, _, _, _, _, err, speed = result
+            on_download_progress(i + 1, total, name, speed, err)
+
+    return results
 
 
 def spotify_type(url: str) -> str:
@@ -568,144 +572,63 @@ def _split_ap_links(links: list[dict]) -> tuple[dict | None, dict | None]:
     return audio, cover
 
 
-async def _ap_handle_track(
-    client: Client,
-    message,
+# ── Apple Music: download one track to a persistent temp dir ─────────────────
+
+async def _ap_download_track_to_dir(
     dl: httpx.AsyncClient,
     idx: int,
     total: int,
     links: list[dict],
     album_thumb_path: str | None,
-    first_track_ref: list,
-    user,
-    progress: ThrottledProgress | None = None,
-    done_ref: list | None = None,        # [int] mutable counter
-    speed_ref: list | None = None,       # [float] last known speed
-):
-    # ── Cancellation check ────────────────────────────────────────────────────
-    if _is_cancelled(user.id):
-        return
-
+    dest_dir: str,
+) -> dict | None:
+    """
+    Downloads audio (and optional cover) for a single AP track into dest_dir.
+    Returns a dict with track info, or None on failure.
+    """
     audio_entry, cover_entry = _split_ap_links(links)
 
     if not audio_entry:
-        await flood_safe(
-            message.reply_text,
-            f"<blockquote>⚠️ <b>Track {idx}/{total}:</b> No audio link found.</blockquote>",
-            parse_mode=ParseMode.HTML,
-            reply_parameters=ReplyParameters(message_id=message.id),
-        )
-        return
+        print(f"[AP Download] Track {idx}/{total}: No audio link found.")
+        return None
 
-    with tempfile.TemporaryDirectory() as tmp:
-        print(f"\n[AP Upload] Track {idx}/{total} → downloading audio…")
+    ok, raw_audio_path, dl_speed = await _ap_download_file(
+        dl, audio_entry["link"], dest_dir, f"track_{idx}.mp3"
+    )
+    if not ok:
+        print(f"[AP Download] Track {idx}/{total}: Audio download failed.")
+        return None
 
-        # ── Update progress: Downloading ──────────────────────────────────────
-        if progress and done_ref is not None:
-            song_hint = f"Track {idx}"
-            bar_text = _build_progress_bar(
-                done_ref[0], total, song_hint, "Downloading⬇️",
-                speed_ref[0] if speed_ref else None, "Apple Music",
-            )
-            await progress.update(bar_text)
+    raw_name = os.path.splitext(os.path.basename(raw_audio_path))[0]
+    song_name = _clean_ap_song_name(raw_name)
+    print(f"[AP Download] Track {idx}/{total} Raw : {raw_name}")
+    print(f"[AP Download] Track {idx}/{total} Name: {song_name}")
 
-        ok, raw_audio_path, dl_speed = await _ap_download_file(
-            dl, audio_entry["link"], tmp, f"track_{idx}.mp3"
-        )
-        if speed_ref is not None:
-            speed_ref[0] = dl_speed
-
-        if not ok:
-            await flood_safe(
-                message.reply_text,
-                f"<blockquote>⚠️ <b>Track {idx}/{total}:</b> Audio download failed.</blockquote>",
-                parse_mode=ParseMode.HTML,
-                reply_parameters=ReplyParameters(message_id=message.id),
-            )
-            return
-
-        if _is_cancelled(user.id):
-            return
-
-        raw_name = os.path.splitext(os.path.basename(raw_audio_path))[0]
-        song_name = _clean_ap_song_name(raw_name)
-        print(f"[AP Upload] Raw : {raw_name}")
-        print(f"[AP Upload] Name: {song_name}")
-
-        safe_fname = _sanitize_filename(song_name) + ".mp3"
-        audio_path = os.path.join(tmp, safe_fname)
+    safe_fname = _sanitize_filename(song_name) + ".mp3"
+    audio_path = os.path.join(dest_dir, safe_fname)
+    if raw_audio_path != audio_path:
         os.rename(raw_audio_path, audio_path)
 
-        if first_track_ref[0] is None:
-            first_track_ref[0] = song_name
-
-        thumb_path = album_thumb_path
-        if cover_entry:
-            c_ok, cover_path, _ = await _ap_download_file(
-                dl, cover_entry["link"], tmp, f"cover_{idx}.jpg"
-            )
-            if c_ok:
-                if not cover_path.lower().endswith((".jpg", ".jpeg")):
-                    jpg_path = cover_path + ".jpg"
-                    os.rename(cover_path, jpg_path)
-                    cover_path = jpg_path
-                thumb_path = cover_path
-
-        # ── Update progress: Uploading ────────────────────────────────────────
-        if progress and done_ref is not None:
-            bar_text = _build_progress_bar(
-                done_ref[0], total, song_name, "Uploading⬆️",
-                speed_ref[0] if speed_ref else None, "Apple Music",
-            )
-            await progress.update(bar_text)
-
-        caption = (
-            f"<blockquote>"
-            f"🎵 <b>{song_name}</b>"
-            f"</blockquote>"
+    thumb_path = album_thumb_path
+    if cover_entry:
+        c_ok, cover_path, _ = await _ap_download_file(
+            dl, cover_entry["link"], dest_dir, f"cover_{idx}.jpg"
         )
+        if c_ok:
+            if not cover_path.lower().endswith((".jpg", ".jpeg")):
+                jpg_path = cover_path + ".jpg"
+                os.rename(cover_path, jpg_path)
+                cover_path = jpg_path
+            thumb_path = cover_path
 
-        try:
-            if thumb_path:
-                await flood_safe(
-                    client.send_photo,
-                    chat_id=message.chat.id,
-                    photo=thumb_path,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    reply_parameters=ReplyParameters(message_id=message.id),
-                )
-
-            await flood_safe(
-                client.send_audio,
-                chat_id=message.chat.id,
-                audio=audio_path,
-                title=song_name,
-                file_name=safe_fname,
-                reply_parameters=ReplyParameters(message_id=message.id),
-            )
-            print(f"[AP Upload] ✓ Track {idx}/{total} sent.")
-
-            # ── Increment done counter and refresh bar ─────────────────────────
-            if done_ref is not None:
-                done_ref[0] += 1
-            if progress and done_ref is not None:
-                bar_text = _build_progress_bar(
-                    done_ref[0], total, song_name, "Uploading⬆️",
-                    speed_ref[0] if speed_ref else None, "Apple Music",
-                )
-                await progress.update(bar_text)
-
-            await log_track_to_channel(client, user, song_name, idx, total, audio_path, thumb_path)
-
-        except Exception as e:
-            print(f"[AP Upload] ✗ Track {idx}/{total} failed: {e}")
-            await flood_safe(
-                message.reply_text,
-                f"<blockquote>⚠️ <b>Track {idx}/{total}:</b> Upload failed — <i>{e}</i></blockquote>",
-                parse_mode=ParseMode.HTML,
-                reply_parameters=ReplyParameters(message_id=message.id),
-            )
+    return {
+        "idx": idx,
+        "song_name": song_name,
+        "safe_fname": safe_fname,
+        "audio_path": audio_path,
+        "thumb_path": thumb_path,
+        "speed": dl_speed,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -805,7 +728,6 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
         )
         return
 
-    # Reset any previous cancel signal before starting
     _reset_cancel_flag(user.id)
 
     async with user_lock:
@@ -829,6 +751,8 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
         progress = ThrottledProgress(status_msg)
 
         is_playlist = False
+        # Persistent temp dir that lives across all download + upload phases
+        master_tmp = tempfile.mkdtemp()
 
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=AP_TIMEOUT) as fetch_cl:
@@ -849,17 +773,17 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                 label = "playlist" if is_playlist else "track"
                 await progress.force_update(
                     f"<blockquote>•ᴗ•<b> Processing {label}</b> ◌ {total} track{'s' if total > 1 else ''}…"
-                    + ("\n<i>Playlist detected - please wait…</i>" if is_playlist else "")
+                    + ("\n<i>Downloading all tracks first, uploads will begin after…</i>" if is_playlist else "")
                     + "</blockquote>",
                 )
 
-                _thumb_tmp = tempfile.mkdtemp()
+                # ── Download album thumbnail ───────────────────────────────────
                 album_thumb_path = None
                 if album_thumb:
                     try:
                         async with fetch_cl.stream("GET", album_thumb) as _r:
                             _r.raise_for_status()
-                            _ap = os.path.join(_thumb_tmp, "album_thumb.jpg")
+                            _ap = os.path.join(master_tmp, "album_thumb.jpg")
                             with open(_ap, "wb") as _f:
                                 async for _chunk in _r.aiter_bytes(CHUNK_SIZE):
                                     _f.write(_chunk)
@@ -867,48 +791,186 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
                     except Exception as e:
                         print(f"[AP Thumb] Album art failed: {e}")
 
-                # ── CHANGED: one shared download client for all tracks ─────────
                 async with httpx.AsyncClient(
                     follow_redirects=True,
                     timeout=AP_TIMEOUT,
                     limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
                 ) as dl:
-                    first_track_ref = [None]
-                    done_ref  = [0]
-                    speed_ref = [None]
-
                     per_request_sem = asyncio.Semaphore(3)
 
-                    # ── CHANGED: sequential loop — one track fully processed before next ──
+                    # ════════════════════════════════════════════════════
+                    # PHASE 1 — Download ALL tracks sequentially
+                    # ════════════════════════════════════════════════════
+                    downloaded_tracks: list[dict | None] = []
+                    dl_done = 0
+                    last_speed = None
+
                     for i, form in enumerate(track_forms):
                         if _is_cancelled(user.id):
                             break
+
+                        # Update progress bar: Downloading
+                        if is_playlist:
+                            bar_text = _build_progress_bar(
+                                dl_done, total,
+                                f"Track {i + 1}",
+                                "Downloading⬇️",
+                                last_speed, "Apple Music",
+                            )
+                            await progress.update(bar_text)
 
                         idx, links = await get_links_for_track(
                             fetch_cl, form, per_request_sem, i + 1
                         )
 
-                        await _ap_handle_track(
-                            bot, msg, dl,
-                            idx, total, links,
-                            album_thumb_path, first_track_ref,
-                            user,
-                            progress=progress if is_playlist else None,
-                            done_ref=done_ref if is_playlist else None,
-                            speed_ref=speed_ref if is_playlist else None,
+                        track_dir = os.path.join(master_tmp, f"track_{i + 1}")
+                        os.makedirs(track_dir, exist_ok=True)
+
+                        track_data = await _ap_download_track_to_dir(
+                            dl, idx, total, links, album_thumb_path, track_dir
                         )
+
+                        downloaded_tracks.append(track_data)
+
+                        if track_data:
+                            dl_done += 1
+                            last_speed = track_data["speed"]
+
+                        # Force-update bar after each download
+                        if is_playlist:
+                            song_hint = track_data["song_name"] if track_data else f"Track {i + 1}"
+                            bar_text = _build_progress_bar(
+                                dl_done, total,
+                                song_hint,
+                                "Downloading⬇️",
+                                last_speed, "Apple Music",
+                            )
+                            await progress.force_update(bar_text)
+
+                    if _is_cancelled(user.id):
+                        # Clean up any downloaded files
+                        import shutil
+                        shutil.rmtree(master_tmp, ignore_errors=True)
+                        await flood_safe(
+                            msg.reply_text,
+                            "<blockquote>🛑 <b>Download cancelled.</b></blockquote>",
+                            parse_mode=ParseMode.HTML,
+                            reply_parameters=ReplyParameters(message_id=msg.id),
+                        )
+                        await progress.delete()
+                        return
+
+                    # ════════════════════════════════════════════════════
+                    # PHASE 2 — Upload ALL tracks sequentially
+                    # ════════════════════════════════════════════════════
+                    if is_playlist:
+                        await progress.force_update(
+                            f"<blockquote>"
+                            f"✅ <b>All {dl_done}/{total} tracks downloaded!</b>\n"
+                            f"<i>Now uploading to Telegram…</i>"
+                            f"</blockquote>"
+                        )
+
+                    first_track_name = None
+                    upload_done = 0
+
+                    for i, track_data in enumerate(downloaded_tracks):
+                        if _is_cancelled(user.id):
+                            break
+
+                        if track_data is None:
+                            print(f"[AP Upload] Track {i + 1}/{total} skipped (download failed).")
+                            if is_playlist:
+                                await flood_safe(
+                                    msg.reply_text,
+                                    f"<blockquote>⚠️ <b>Track {i + 1}/{total}:</b> Download had failed, skipping.</blockquote>",
+                                    parse_mode=ParseMode.HTML,
+                                    reply_parameters=ReplyParameters(message_id=msg.id),
+                                )
+                            continue
+
+                        idx        = track_data["idx"]
+                        song_name  = track_data["song_name"]
+                        safe_fname = track_data["safe_fname"]
+                        audio_path = track_data["audio_path"]
+                        thumb_path = track_data["thumb_path"]
+
+                        if first_track_name is None:
+                            first_track_name = song_name
+
+                        # Update progress bar: Uploading
+                        if is_playlist:
+                            bar_text = _build_progress_bar(
+                                upload_done, total,
+                                song_name,
+                                "Uploading⬆️",
+                                track_data["speed"], "Apple Music",
+                            )
+                            await progress.update(bar_text)
+
+                        caption = (
+                            f"<blockquote>"
+                            f"🎵 <b>{song_name}</b>"
+                            f"</blockquote>"
+                        )
+
+                        try:
+                            if thumb_path and os.path.exists(thumb_path):
+                                await flood_safe(
+                                    bot.send_photo,
+                                    chat_id=msg.chat.id,
+                                    photo=thumb_path,
+                                    caption=caption,
+                                    parse_mode=ParseMode.HTML,
+                                    reply_parameters=ReplyParameters(message_id=msg.id),
+                                )
+
+                            await flood_safe(
+                                bot.send_audio,
+                                chat_id=msg.chat.id,
+                                audio=audio_path,
+                                title=song_name,
+                                file_name=safe_fname,
+                                reply_parameters=ReplyParameters(message_id=msg.id),
+                            )
+                            print(f"[AP Upload] ✓ Track {idx}/{total} sent.")
+                            upload_done += 1
+
+                            # Force bar update after each upload
+                            if is_playlist:
+                                bar_text = _build_progress_bar(
+                                    upload_done, total,
+                                    song_name,
+                                    "Uploading⬆️",
+                                    track_data["speed"], "Apple Music",
+                                )
+                                await progress.force_update(bar_text)
+
+                            await log_track_to_channel(bot, user, song_name, idx, total, audio_path, thumb_path)
+
+                        except Exception as e:
+                            print(f"[AP Upload] ✗ Track {idx}/{total} failed: {e}")
+                            await flood_safe(
+                                msg.reply_text,
+                                f"<blockquote>⚠️ <b>Track {idx}/{total}:</b> Upload failed — <i>{e}</i></blockquote>",
+                                parse_mode=ParseMode.HTML,
+                                reply_parameters=ReplyParameters(message_id=msg.id),
+                            )
 
                         if is_playlist and (i + 1) < total:
                             await asyncio.sleep(PLAYLIST_UPLOAD_DELAY)
-                    # ─────────────────────────────────────────────────────────
 
         except asyncio.CancelledError:
-            pass  # handled below
+            pass
         except Exception as e:
             await progress.force_update(
                 f"<blockquote>❌ <b>Failed.</b>\n<i>{e}</i></blockquote>",
             )
             return
+        finally:
+            # Clean up all temp files
+            import shutil
+            shutil.rmtree(master_tmp, ignore_errors=True)
 
         # ── Post-download messages ────────────────────────────────────────────
         if _is_cancelled(user.id):
@@ -922,18 +984,17 @@ async def _handle_apple_music(bot: Client, msg: Message, url: str, user):
             return
 
         if is_playlist:
-            done_count = done_ref[0]
             await flood_safe(
                 msg.reply_text,
                 f"<blockquote>"
                 f"✅ <b>Playlist done!</b>\n\n"
-                f"<b>Total :</b>  {done_count} track{'s' if done_count != 1 else ''} sent 🎶"
+                f"<b>Total :</b>  {upload_done} track{'s' if upload_done != 1 else ''} sent 🎶"
                 f"</blockquote>",
                 parse_mode=ParseMode.HTML,
                 reply_parameters=ReplyParameters(message_id=msg.id),
             )
 
-        await log_download_summary(bot, user, first_track_ref[0] or "Unknown", total)
+        await log_download_summary(bot, user, first_track_name or "Unknown", total)
         await progress.delete()
 
 
@@ -986,57 +1047,159 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
         _reset_cancel_flag(user.id)
 
         async with user_lock:
-            status_msg = await msg.reply_text("fetching playlist...")
+            status_msg = await msg.reply_text(
+                "<blockquote>ᯓ➤<b>Processing playlist • • •</b>\n"
+                "<i>Downloading all tracks first, uploads will begin after…</i></blockquote>",
+                parse_mode=ParseMode.HTML,
+                reply_parameters=ReplyParameters(message_id=msg.id),
+            )
             progress = ThrottledProgress(status_msg)
 
-            completed  = 0
-            failed     = 0
-            total_ref  = [0]
-            speed_ref  = [None]
             main_loop  = asyncio.get_event_loop()
+            total_ref  = [0]
+            dl_done_ref = [0]
+            speed_ref  = [None]
 
-            # ── CHANGED: on_result now awaits upload before returning ─────────
-            # We use a threading Event so the executor thread blocks until the
-            # coroutine dispatched into the event loop has fully completed.
-            def on_result(index, name, title, artist, local_path, thumb, err, speed, total):
-                nonlocal completed, failed
+            # ── Thread-safe download progress callback ─────────────────────────
+            # Called from executor thread after each track is downloaded.
+            # Uses an event to signal the async side so the progress bar updates.
+            _dl_progress_queue: asyncio.Queue = asyncio.Queue()
+
+            def on_download_progress(done, total, name, speed, err):
                 total_ref[0] = total
                 if speed:
                     speed_ref[0] = speed
-                if err:
-                    failed += 1
-                else:
-                    completed += 1
+                if not err:
+                    dl_done_ref[0] = done
+                # Push update to async queue (thread-safe)
+                asyncio.run_coroutine_threadsafe(
+                    _dl_progress_queue.put((done, total, name, speed, err)),
+                    loop=main_loop,
+                )
 
-                # Submit coroutine and WAIT for it to finish before continuing
-                # so the next _spoti_fetch_one only starts after upload is done.
-                done_event = threading.Event()
-
-                async def _run_and_signal():
-                    try:
-                        await _spoti_send_track(
-                            bot, msg, progress,
-                            name, title, artist, local_path, thumb, err,
-                            completed, failed, total, user, speed_ref,
-                        )
-                    finally:
-                        done_event.set()
-
-                asyncio.run_coroutine_threadsafe(_run_and_signal(), loop=main_loop)
-                done_event.wait()   # block the thread until upload finishes
-            # ─────────────────────────────────────────────────────────────────
-
+            # ════════════════════════════════════════════════════════════
+            # PHASE 1 — Download ALL tracks in executor thread
+            # ════════════════════════════════════════════════════════════
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
+
+                # Spawn a task to drain progress updates while downloading
+                async def _drain_dl_progress():
+                    while True:
+                        item = await _dl_progress_queue.get()
+                        if item is None:
+                            break
+                        done, total, name, speed, err = item
+                        bar_text = _build_progress_bar(
+                            done, total, name,
+                            "Downloading⬇️" if not err else "Failed⚠️",
+                            speed, "Spotify",
+                        )
+                        await progress.force_update(bar_text)
+
+                drain_task = asyncio.ensure_future(_drain_dl_progress())
+
+                all_results = await loop.run_in_executor(
                     None,
-                    lambda: spotify_get_playlist(url, on_result=on_result),
+                    lambda: spotify_get_playlist_all(url, on_download_progress=on_download_progress),
                 )
+
+                # Signal drain task to stop
+                await _dl_progress_queue.put(None)
+                await drain_task
+
             except Exception as e:
                 await progress.force_update(
                     f"<blockquote>❌ something went wrong\n\n<code>{e}</code></blockquote>",
                 )
                 return
+
+            if _is_cancelled(user.id):
+                # Clean up all downloaded files
+                for result in all_results:
+                    index, name, title, artist, local_path, thumb, err, speed, total = result
+                    cleanup(local_path)
+                    cleanup(thumb)
+                await flood_safe(
+                    msg.reply_text,
+                    "<blockquote>🛑 <b>Download cancelled.</b></blockquote>",
+                    parse_mode=ParseMode.HTML,
+                    reply_parameters=ReplyParameters(message_id=msg.id),
+                )
+                await progress.delete()
+                return
+
+            total = total_ref[0]
+            dl_success = sum(1 for r in all_results if r[6] is None)  # err is index 6
+
+            # Announce upload phase
+            await progress.force_update(
+                f"<blockquote>"
+                f"✅ <b>All {dl_success}/{total} tracks downloaded!</b>\n"
+                f"<i>Now uploading to Telegram…</i>"
+                f"</blockquote>"
+            )
+
+            # ════════════════════════════════════════════════════════════
+            # PHASE 2 — Upload ALL tracks sequentially
+            # ════════════════════════════════════════════════════════════
+            completed = 0
+            failed    = 0
+
+            for i, result in enumerate(all_results):
+                if _is_cancelled(user.id):
+                    # Clean up remaining files
+                    for r in all_results[i:]:
+                        cleanup(r[4])  # local_path
+                        cleanup(r[5])  # thumb
+                    break
+
+                index, name, title, artist, local_path, thumb, err, speed, total = result
+
+                if err:
+                    print(f"[Spotify skip] {name}: {err}")
+                    failed += 1
+                    bar_text = _build_progress_bar(
+                        completed + failed, total, name, "Skipped⚠️",
+                        speed_ref[0], "Spotify",
+                    )
+                    await progress.update(bar_text)
+                    continue
+
+                # Update bar: uploading
+                bar_text = _build_progress_bar(
+                    completed + failed, total, name, "Uploading⬆️",
+                    speed if speed else speed_ref[0], "Spotify",
+                )
+                await progress.update(bar_text)
+
+                try:
+                    await msg.reply_audio(
+                        audio=local_path,
+                        caption=f"<b>{name}</b>",
+                        title=title,
+                        performer=artist,
+                        thumb=thumb,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    completed += 1
+                    await log_download(bot, user, name)
+
+                    bar_text = _build_progress_bar(
+                        completed + failed, total, name, "Uploading⬆️",
+                        speed if speed else speed_ref[0], "Spotify",
+                    )
+                    await progress.force_update(bar_text)
+
+                except Exception as e:
+                    print(f"[Spotify send] {name}: {e}")
+                    failed += 1
+                finally:
+                    cleanup(local_path)
+                    cleanup(thumb)
+
+                if (i + 1) < total:
+                    await asyncio.sleep(PLAYLIST_UPLOAD_DELAY)
 
             # ── Final summary ─────────────────────────────────────────────────
             if _is_cancelled(user.id):
@@ -1061,57 +1224,6 @@ async def _handle_spotify(bot: Client, msg: Message, url: str, user):
 
     else:
         await msg.reply_text("unsupported spotify link type.")
-
-
-async def _spoti_send_track(
-    bot, msg, progress: ThrottledProgress,
-    name, title, artist, local_path, thumb, err,
-    completed, failed, total, user,
-    speed_ref: list,
-):
-    # Check cancellation
-    if _is_cancelled(user.id):
-        cleanup(local_path)
-        cleanup(thumb)
-        return
-
-    if err:
-        print(f"[Spotify skip] {name}: {err}")
-        bar_text = _build_progress_bar(
-            completed + failed, total, name, "Skipped⚠️",
-            speed_ref[0], "Spotify",
-        )
-        await progress.update(bar_text)
-        return
-
-    try:
-        bar_text = _build_progress_bar(
-            completed + failed - 1, total, name, "Uploading⬆️",
-            speed_ref[0], "Spotify",
-        )
-        await progress.update(bar_text)
-
-        await msg.reply_audio(
-            audio=local_path,
-            caption=f"<b>{name}</b>",
-            title=title,
-            performer=artist,
-            thumb=thumb,
-            parse_mode=ParseMode.HTML,
-        )
-        await log_download(bot, user, name)
-
-        bar_text = _build_progress_bar(
-            completed + failed, total, name, "Uploading⬆️",
-            speed_ref[0], "Spotify",
-        )
-        await progress.update(bar_text)
-
-    except Exception as e:
-        print(f"[Spotify send] {name}: {e}")
-    finally:
-        cleanup(local_path)
-        cleanup(thumb)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
