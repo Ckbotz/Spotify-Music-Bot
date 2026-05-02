@@ -15,6 +15,7 @@ COPY mongodb.py .
 COPY spotify_music_bot.py .
 COPY ap.py .
 COPY index.py .
+COPY stats.py .
 
 RUN mkdir -p /app/downloads
 
