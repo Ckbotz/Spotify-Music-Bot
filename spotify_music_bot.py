@@ -9,7 +9,6 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
-
 import httpx
 import requests
 from bs4 import BeautifulSoup
